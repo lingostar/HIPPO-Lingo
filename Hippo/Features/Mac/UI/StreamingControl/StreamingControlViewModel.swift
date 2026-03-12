@@ -56,6 +56,10 @@ public final class StreamingControlViewModel {
 
     private let logger = Logger(subsystem: "com.television.hippo", category: "StreamingControl")
 
+    // Device hot-plug notification observers
+    private var deviceConnectedObserver: Any?
+    private var deviceDisconnectedObserver: Any?
+
     // MARK: - State: Video & Camera Mode
 
     var videoMode: VideoMode = .halfSBS {
@@ -207,7 +211,50 @@ public final class StreamingControlViewModel {
     /// Private init for singleton
     private init() {
         loadAvailableDevices()
+        setupDeviceNotifications()
         startEmbeddedServer()
+    }
+
+    // MARK: - Device Hot-Plug Detection
+
+    /// USB 카메라 연결/해제를 자동 감지하여 디바이스 목록을 갱신합니다
+    private func setupDeviceNotifications() {
+        deviceConnectedObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasConnected,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let deviceName = (notification.object as? AVCaptureDevice)?.localizedName ?? "unknown"
+            Task { @MainActor [weak self] in
+                self?.logger.info("📷 Device connected: \(deviceName)")
+                self?.loadAvailableDevices()
+            }
+        }
+
+        deviceDisconnectedObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceWasDisconnected,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let deviceName = (notification.object as? AVCaptureDevice)?.localizedName ?? "unknown"
+            Task { @MainActor [weak self] in
+                self?.logger.info("📷 Device disconnected: \(deviceName)")
+                self?.loadAvailableDevices()
+
+                // 스트리밍 중인 카메라가 해제되면 스트리밍 중지
+                if self?.isStreaming == true {
+                    if let device = notification.object as? AVCaptureDevice {
+                        let isActiveDevice = device.uniqueID == self?.selectedLeftDevice?.uniqueID
+                            || device.uniqueID == self?.selectedRightDevice?.uniqueID
+                            || device.uniqueID == self?.selectedSingleDevice?.uniqueID
+                        if isActiveDevice {
+                            self?.logger.warning("⚠️ Active streaming device disconnected, stopping stream")
+                            self?.stopStreaming()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Embedded Signaling Server
@@ -296,8 +343,22 @@ public final class StreamingControlViewModel {
     // MARK: - Public Methods: Device Management
 
     /// 사용 가능한 카메라 장치 목록을 로드합니다
+    /// - 카메라 권한이 없으면 사용자에게 요청합니다
+    /// - 핫플러그 시 기존 선택을 uniqueID로 재매칭하여 SwiftUI Picker 동기화를 보장합니다
     func loadAvailableDevices() {
         Task { @MainActor in
+            // 카메라 권한 확인 및 요청
+            let authStatus = AVCaptureDevice.authorizationStatus(for: .video)
+            if authStatus == .notDetermined {
+                let granted = await AVCaptureDevice.requestAccess(for: .video)
+                if !granted {
+                    logger.warning("Camera access denied by user")
+                    return
+                }
+            } else if authStatus == .denied || authStatus == .restricted {
+                logger.warning("Camera access not available (status: \(authStatus.rawValue))")
+            }
+
             #if os(macOS)
             let discoverySession = AVCaptureDevice.DiscoverySession(
                 deviceTypes: [.external, .builtInWideAngleCamera],
@@ -312,27 +373,41 @@ public final class StreamingControlViewModel {
             )
             #endif
 
-            availableDevices = discoverySession.devices
+            let newDevices = discoverySession.devices
+
+            // 변경사항 로그
+            let oldNames = Set(availableDevices.map(\.localizedName))
+            let newNames = Set(newDevices.map(\.localizedName))
+            if oldNames != newNames {
+                let added = newNames.subtracting(oldNames)
+                let removed = oldNames.subtracting(newNames)
+                if !added.isEmpty { logger.info("📷 New devices: \(added.joined(separator: ", "))") }
+                if !removed.isEmpty { logger.info("📷 Removed devices: \(removed.joined(separator: ", "))") }
+            }
+
+            availableDevices = newDevices
+
+            // 기존 선택을 새 인스턴스로 재매칭 (SwiftUI Picker 태그 일치를 위해 uniqueID 기반)
+            let prevLeftID = selectedLeftDevice?.uniqueID
+            let prevRightID = selectedRightDevice?.uniqueID
+            let prevSingleID = selectedSingleDevice?.uniqueID
+
+            selectedLeftDevice = newDevices.first(where: { $0.uniqueID == prevLeftID })
+            selectedRightDevice = newDevices.first(where: { $0.uniqueID == prevRightID })
+            selectedSingleDevice = newDevices.first(where: { $0.uniqueID == prevSingleID })
+
+            // 선택이 nil이면 자동 선택
+            if selectedLeftDevice == nil { selectedLeftDevice = newDevices.first }
+            if selectedRightDevice == nil {
+                selectedRightDevice = newDevices.count >= 2 ? newDevices[1] : newDevices.first
+            }
+            if selectedSingleDevice == nil { selectedSingleDevice = newDevices.first }
 
             print("[Device Discovery] Found \(availableDevices.count) devices")
             for (index, device) in availableDevices.enumerated() {
                 print("  [\(index)] \(device.localizedName) - ID: \(device.uniqueID)")
             }
-
-            // 기본 장치 선택
-            if availableDevices.count >= 2 {
-                selectedLeftDevice = availableDevices[0]
-                selectedRightDevice = availableDevices[1]
-                selectedSingleDevice = availableDevices[0]
-                print("[Device Selection] Left: \(selectedLeftDevice?.localizedName ?? "nil"), Right: \(selectedRightDevice?.localizedName ?? "nil")")
-            } else if let firstDevice = availableDevices.first {
-                selectedLeftDevice = firstDevice
-                selectedRightDevice = firstDevice
-                selectedSingleDevice = firstDevice
-                print("[Device Selection] Single device: \(firstDevice.localizedName)")
-            } else {
-                print("[Device Selection] No devices found")
-            }
+            print("[Device Selection] Left: \(selectedLeftDevice?.localizedName ?? "nil"), Right: \(selectedRightDevice?.localizedName ?? "nil"), Single: \(selectedSingleDevice?.localizedName ?? "nil")")
         }
     }
 
